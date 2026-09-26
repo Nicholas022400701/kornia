@@ -209,6 +209,33 @@ class TestFindEssential(BaseTester):
         assert expected.abs().max() > 0
         self.assert_close(torch.func.grad(loss)(points1), expected)
 
+    def test_solve_2x2_gradient_at_large_entries_4952(self, device, dtype):
+        # _solve_2x2_tikhonov_safe evaluates its Tikhonov fallback for every slot and picks it with torch.where,
+        # whose backward multiplies the fallback's zero gradient by the values computed there. The fallback squares
+        # the entries twice in det_m, which overflows float32 to inf - inf = NaN from |A| of about 4e9, so a
+        # well-conditioned slot solved by the direct branch got a NaN gradient (#4952: 14 of 100 no-parallax
+        # float32 samples of the issue's loop on one machine). At the same magnitudes the backward of 1 / det
+        # underflowed and dropped the det term of the gradient. The magnitudes below overflow det_m in each dtype.
+        big = {torch.float16: 1e2, torch.bfloat16: 1e10, torch.float32: 1e13, torch.float64: 1e80}[dtype]
+        A = big * torch.tensor([[[2.0, 1.0], [0.5, 3.0]]], device=device, dtype=dtype)
+        b = big * torch.tensor([[[1.0], [-2.0]]], device=device, dtype=dtype)
+        A.requires_grad_()
+        b.requires_grad_()
+        x, bad = epi.essential._solve_2x2_tikhonov_safe(A, b)
+        assert not bad.any()
+        # A x = b with det 5.5: x = (10 / 11, -9 / 11), the same at every scale
+        self.assert_close(x, torch.tensor([[[10.0 / 11.0], [-9.0 / 11.0]]], device=device, dtype=dtype))
+        x.sum().backward()
+        assert torch.isfinite(A.grad).all(), A.grad
+        assert torch.isfinite(b.grad).all(), b.grad
+        # the gradient of the direct solve, from torch.linalg.solve in float64 on the CPU
+        ref_A = (big * torch.tensor([[[2.0, 1.0], [0.5, 3.0]]], dtype=torch.float64)).requires_grad_()
+        ref_b = (big * torch.tensor([[[1.0], [-2.0]]], dtype=torch.float64)).requires_grad_()
+        torch.linalg.solve(ref_A, ref_b).sum().backward()
+        # the gradients are of order 1 / big, so compare them scaled back to order 1
+        self.assert_close(A.grad * big, (ref_A.grad * big).to(device=device, dtype=dtype))
+        self.assert_close(b.grad * big, (ref_b.grad * big).to(device=device, dtype=dtype))
+
     @pytest.mark.parametrize("batch_size, num_points", [(5, 5), (10, 5)])
     def test_degenerate_case(self, batch_size, num_points, device, dtype, monkeypatch):
         B, N = batch_size, num_points

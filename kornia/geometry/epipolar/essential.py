@@ -127,8 +127,21 @@ def _solve_2x2_tikhonov_safe(A: torch.Tensor, b: torch.Tensor, eps: float = 1e-1
     det_abs = det.abs()
     bad = (det_abs <= eps) | torch.isnan(det_abs) | torch.isinf(det_abs)
 
+    # Solve at unit scale: divide A and b by the power of two just below max|A| (#4952). The division is exact,
+    # so the direct solution is bitwise the one of the unscaled system, while the intermediates of both branches
+    # stay far from overflow. They did not before: from |A| of about 4e9 in float32, det_m of the fallback below
+    # overflowed to inf - inf = NaN, which the backward of torch.where multiplied (as 0 * NaN) into the gradient
+    # of the slots that used the direct branch, and the backward of 1 / det lost the det term because 1 / det**2
+    # underflowed to 0.
+    magnitude = A.abs().flatten(-2).amax(-1)
+    magnitude = torch.where(magnitude > 0, magnitude, torch.ones_like(magnitude))
+    scale = torch.exp2(torch.floor(torch.log2(magnitude)))
+    a, bb, c, d = a / scale, bb / scale, c / scale, d / scale
+    b0, b1 = b[..., 0, 0] / scale, b[..., 1, 0] / scale
+
     # ---- direct inverse branch (but branchless via where) ----
-    det_safe = torch.where(det_abs > eps, det, torch.ones_like(det) * eps)
+    det_scaled = a * d - bb * c
+    det_safe = torch.where(bad, torch.ones_like(det_scaled), det_scaled)
     inv_det = 1.0 / det_safe
 
     inv00 = d * inv_det
@@ -136,8 +149,8 @@ def _solve_2x2_tikhonov_safe(A: torch.Tensor, b: torch.Tensor, eps: float = 1e-1
     inv10 = (-c) * inv_det
     inv11 = a * inv_det
 
-    x0_dir = inv00 * b[..., 0, 0] + inv01 * b[..., 1, 0]
-    x1_dir = inv10 * b[..., 0, 0] + inv11 * b[..., 1, 0]
+    x0_dir = inv00 * b0 + inv01 * b1
+    x1_dir = inv10 * b0 + inv11 * b1
     x_dir = torch.stack((x0_dir, x1_dir), dim=-1).unsqueeze(-1)  # (...,2,1)
 
     # ---- fallback: normal equations with λI (always SPD if λ>0) ----
@@ -148,8 +161,8 @@ def _solve_2x2_tikhonov_safe(A: torch.Tensor, b: torch.Tensor, eps: float = 1e-1
     ata01 = a * bb + c * d
     ata11 = bb * bb + d * d
 
-    atb0 = a * b[..., 0, 0] + c * b[..., 1, 0]
-    atb1 = bb * b[..., 0, 0] + d * b[..., 1, 0]
+    atb0 = a * b0 + c * b1
+    atb1 = bb * b0 + d * b1
 
     # λ from trace scale; ensure strictly positive even if A is zero
     tr = ata00 + ata11
